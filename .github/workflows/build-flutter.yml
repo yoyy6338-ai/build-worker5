@@ -1,0 +1,135 @@
+
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "Job ID"
+        required: true
+        type: string
+      userId:
+        description: "User ID"
+        required: true
+        type: string
+      payload:
+        description: "Build payload JSON"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare Project
+        env:
+          BUILD_PAYLOAD: ${{ inputs.payload }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          printf '%s' "$BUILD_PAYLOAD" > "$RUNNER_TEMP/payload.json"
+
+          URL=$(jq -r '.zipAssetUrl // .url // empty' \
+            "$RUNNER_TEMP/payload.json")
+
+          if [[ -z "$URL" ]]; then
+            echo "::error::URL ZIP tidak ditemukan dalam payload."
+            exit 1
+          fi
+
+          case "$URL" in
+            https://*) ;;
+            *)
+              echo "::error::URL ZIP harus menggunakan HTTPS."
+              exit 1
+              ;;
+          esac
+
+          curl --fail --location --show-error \
+            --retry 3 \
+            "$URL" \
+            --output "$RUNNER_TEMP/project.zip"
+
+          unzip -tq "$RUNNER_TEMP/project.zip"
+
+          mkdir -p "$RUNNER_TEMP/source"
+          unzip -q "$RUNNER_TEMP/project.zip" \
+            -d "$RUNNER_TEMP/source"
+
+          PUBSPEC=$(find "$RUNNER_TEMP/source" \
+            -maxdepth 6 -type f -name pubspec.yaml \
+            -print -quit)
+
+          if [[ -z "$PUBSPEC" ]]; then
+            echo "::error::pubspec.yaml tidak ditemukan."
+            exit 1
+          fi
+
+          echo "PROJECT_ROOT=$(dirname "$PUBSPEC")" \
+            >> "$GITHUB_ENV"
+
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          flutter pub get
+
+      - name: Build Release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          flutter build apk --release
+
+      - name: Find APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK=$(find "$PROJECT_ROOT/build" \
+            -type f -name '*.apk' \
+            -path '*/outputs/flutter-apk/*' \
+            -print -quit)
+
+          if [[ -z "$APK" ]]; then
+            echo "::error::APK tidak ditemukan."
+            find "$PROJECT_ROOT/build" \
+              -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/apk-output"
+          cp "$APK" "$RUNNER_TEMP/apk-output/app-release.apk"
+
+          echo "APK ditemukan:"
+          ls -lh "$RUNNER_TEMP/apk-output/app-release.apk"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: ${{ runner.temp }}/apk-output/app-release.apk
+          if-no-files-found: error
+          retention-days: 7
